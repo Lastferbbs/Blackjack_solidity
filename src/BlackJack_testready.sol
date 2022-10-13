@@ -1,0 +1,564 @@
+//SPDX-Licence-Identifier: MIT
+pragma solidity ^0.8.0;
+
+error TooBigBet();
+error NotMinedYet();
+error BetSizeMustBeTheSameOrNotEnoughChips(uint256);
+error GameIsOver();
+
+contract BlackJack {
+    mapping(address => uint256) public current_bet;
+    mapping(address => uint256) public current_value_player; // wziac pod uwage karty osobno, do splita
+    mapping(address => uint256) public current_value_dealer;
+    mapping(address => uint256) public player_block; // first block chosen to generate cards
+    mapping(address => uint256) public current_block;
+    mapping(address => uint256) public dealer_block;
+    mapping(address => bool) public split_bool;
+    mapping(address => uint256) public aces_number;
+    mapping(address => bool) public game_over;
+    mapping(address => uint256) public winnings;
+    mapping(address => bool) public stand_status;
+    mapping(address => uint256) public availableChips; // mozna odejmowac 10 od current_value_player za kazdego asa, do tego odejmowac asa przy > 21
+    mapping(address => uint256) public cashInPool;
+
+    uint256 public casinoBalance;
+
+    modifier gameFinished() {
+        if (stand_status[msg.sender] || game_over[msg.sender]) {
+            revert GameIsOver();
+        }
+
+        _;
+    }
+
+    modifier settlePlayer() {
+        if (stand_status[msg.sender] || game_over[msg.sender]) {
+            (, , bool blackjk) = playerHand();
+            (, bool dealersblackjk, ) = dealersHand();
+
+            if (blackjk && dealersblackjk) {
+                availableChips[msg.sender] =
+                    availableChips[msg.sender] +
+                    cashInPool[msg.sender] /
+                    2;
+                casinoBalance = casinoBalance + cashInPool[msg.sender] / 2;
+            } else if (!blackjk && dealersblackjk) {
+                casinoBalance = casinoBalance + cashInPool[msg.sender];
+            } else if (blackjk && !dealersblackjk) {
+                availableChips[msg.sender] =
+                    availableChips[msg.sender] +
+                    (cashInPool[msg.sender]) +
+                    cashInPool[msg.sender] /
+                    4;
+                casinoBalance = casinoBalance - cashInPool[msg.sender] / 4;
+            } else if (current_value_player[msg.sender] > 21) {
+                casinoBalance = casinoBalance + cashInPool[msg.sender];
+            } else if (
+                current_value_player[msg.sender] == dealerEndGameHand()
+            ) {
+                // uwzglednic funkcje do reki dealera
+                availableChips[msg.sender] =
+                    availableChips[msg.sender] +
+                    cashInPool[msg.sender] /
+                    2;
+                casinoBalance = casinoBalance + cashInPool[msg.sender] / 2;
+            } else if (
+                dealerEndGameHand() > 21 &&
+                current_value_player[msg.sender] < 22
+            ) {
+                availableChips[msg.sender] =
+                    availableChips[msg.sender] +
+                    cashInPool[msg.sender];
+            } else if (
+                current_value_player[msg.sender] < 21 &&
+                current_value_player[msg.sender] < dealerEndGameHand()
+            ) {
+                casinoBalance = casinoBalance + cashInPool[msg.sender];
+            }
+            _;
+        }
+    }
+
+    modifier cleanOldGame() {
+        if (stand_status[msg.sender] || game_over[msg.sender]) {
+            current_bet[msg.sender] = 0;
+            current_value_player[msg.sender] = 0; // wziac pod uwage karty osobno, do splita
+            current_value_dealer[msg.sender] = 0;
+            player_block[msg.sender] = 0; // first block chosen to generate cards
+            current_block[msg.sender] = 0;
+            dealer_block[msg.sender] = 0;
+            split_bool[msg.sender] = false;
+            aces_number[msg.sender] = 0;
+            game_over[msg.sender] = false;
+            winnings[msg.sender] = 0;
+            stand_status[msg.sender] = false;
+            //availableChips[msg.sender] = 0; // mozna odejmowac 10 od current_value_player za kazdego asa, do tego odejmowac asa przy > 21
+            cashInPool[msg.sender] = 0;
+        }
+        _;
+    }
+
+    modifier above21or21() {
+        if (
+            current_value_player[msg.sender] == 0 &&
+            player_block[msg.sender] != 0
+        ) {
+            (, bool dealersblackjk, ) = dealersHand();
+            if (dealersblackjk) {
+                stand_status[msg.sender] = true;
+            }
+            (uint256 value1, uint256 value2, ) = playerHand();
+            current_value_player[msg.sender] = value1 + value2;
+            if (value1 == 11 && value2 == 11 && aces_number[msg.sender] == 0) {
+                aces_number[msg.sender] = 2;
+            } else if (value1 == 11 && aces_number[msg.sender] == 0) {
+                aces_number[msg.sender] = 1;
+            } else if (value2 == 11 && aces_number[msg.sender] == 0) {
+                aces_number[msg.sender] = 1;
+            }
+        }
+        // gdzie sa sumowe karty w przypadku standa????
+        else if (
+            blockhash(current_block[msg.sender]) > 0 &&
+            (!stand_status[msg.sender] && !game_over[msg.sender])
+        ) {
+            // gdzie sa sumowe karty w przypadku standa????
+            //zastanowic sie jaki jest powod by nie uwzgledniac tutaj tez 21
+            if (current_value_player[msg.sender] + currentHitCard() > 21) {
+                if (
+                    currentHitCard() == 11 || aces_number[msg.sender] > 0
+                ) {} else {
+                    game_over[msg.sender] = true;
+                    current_value_player[msg.sender] =
+                        current_value_player[msg.sender] +
+                        currentHitCard();
+                    // mozna by to obejść sumując karty w current_value_player
+                }
+                // dobieranie kart krupiera
+                // sprawdzeniie kto wygrał
+                // nie zmieniac wartosci asow, jedynie nie zaznaczac przegranej wtedy
+            }
+            if (current_value_player[msg.sender] + currentHitCard() == 21) {
+                stand_status[msg.sender] = true;
+                current_value_player[msg.sender] =
+                    current_value_player[msg.sender] +
+                    currentHitCard();
+            }
+        }
+
+        _;
+    }
+
+    modifier blackjack() {
+        (, , bool blackjk) = playerHand();
+        (, bool dealersblackjk, ) = dealersHand();
+        if (blackjk && dealersblackjk) {
+            game_over[msg.sender] = true;
+            // remis i zakończenie gry
+        } else if (!blackjk && dealersblackjk) {
+            game_over[msg.sender] = true;
+            // przegrana i zakończenie gry
+        } else if (blackjk && !dealersblackjk) {
+            game_over[msg.sender] = true;
+            // wygrana i zakończenie gry
+        }
+        _; //do sprawdzenia, pewnie trzeba bedzie dodac transfery pieniezne juz tutaj
+    }
+
+    modifier get_dealer_cards() {
+        _;
+        if (stand_status[msg.sender]) {
+            current_block[msg.sender] = block.number + 1;
+        }
+    }
+
+    //reetrance guard
+
+    function casinoDeposit() public payable {
+        // onlyOwner
+        casinoBalance += msg.value;
+    }
+
+    function casinoWithdraw(uint256 withdraw_money) public {
+        // onlyOwner
+        if (withdraw_money <= casinoBalance) {
+            casinoBalance -= withdraw_money;
+            // transfer
+        }
+    }
+
+    function buyChips() public payable settlePlayer cleanOldGame {
+        if (msg.value > address(this).balance / 10) {
+            // pytanie czy jest sens to sprawdzac
+            revert TooBigBet();
+        }
+        availableChips[msg.sender] += msg.value;
+    }
+
+    function withdrawMoney(uint256 cash)
+        public
+        above21or21
+        settlePlayer
+        cleanOldGame
+    {
+        if (cash <= availableChips[msg.sender]) {
+            availableChips[msg.sender] -= cash;
+            //transfer to msg.sender
+            // revert TooBigBet();
+        }
+    }
+
+    function betWithChips(uint256 bet_size)
+        public
+        above21or21
+        settlePlayer
+        cleanOldGame
+    {
+        if (bet_size > address(this).balance / 10) {
+            revert TooBigBet();
+        }
+        availableChips[msg.sender] -= bet_size;
+        current_bet[msg.sender] = bet_size;
+        player_block[msg.sender] = block.number + 1;
+        cashInPool[msg.sender] = bet_size * 2;
+        casinoBalance -= bet_size;
+    }
+
+    function bet() public payable settlePlayer cleanOldGame {
+        if (msg.value > address(this).balance / 10) {
+            revert TooBigBet();
+        }
+        // uwzglednic minimalny bet
+        current_bet[msg.sender] = msg.value;
+        player_block[msg.sender] = block.number + 1;
+        cashInPool[msg.sender] = msg.value * 2;
+        casinoBalance -= msg.value;
+    }
+
+    function bet_with_winnings() public {}
+
+    function hit() public gameFinished blackjack above21or21 {
+        //uwzglednic ponizsze sumowanie tylko, gdy gra trwa tj. bez stand i gameover
+        if (current_value_player[msg.sender] != 0 && currentHitCard() != 0) {
+            //zastanowic sie nad revert
+            current_value_player[msg.sender] += currentHitCard();
+            if (currentHitCard() == 11) {
+                aces_number[msg.sender] += 1;
+            }
+        }
+        if (
+            current_value_player[msg.sender] > 21 &&
+            aces_number[msg.sender] != 0
+        ) {
+            for (uint256 i = aces_number[msg.sender]; i > 0; i--) {
+                if (current_value_player[msg.sender] - i * 10 > 21) {
+                    // uwzglednic asy do standa /////////////////////////////
+                    game_over[msg.sender] = true;
+                }
+            }
+        }
+
+        current_block[msg.sender] = block.number + 1;
+    }
+
+    function stand() public gameFinished above21or21 get_dealer_cards {
+        if (stand_status[msg.sender] || game_over[msg.sender]) {
+            revert GameIsOver();
+        }
+        // modyfikator, ktory sprawdza czy nie jest powyzej 21!
+        else {
+            stand_status[msg.sender] = true;
+            if (
+                current_value_player[msg.sender] > 21 &&
+                aces_number[msg.sender] != 0
+            ) {
+                for (uint256 i = 1; i <= aces_number[msg.sender]; i++) {
+                    if (current_value_player[msg.sender] - i * 10 < 21) {
+                        current_value_player[msg.sender] =
+                            current_value_player[msg.sender] -
+                            i *
+                            10;
+                        // uwzglednic asy do standa /////////////////////////////
+                        game_over[msg.sender] = true;
+                        break; // uwzglednienie optymalnego wyniku dla gracza
+                    }
+                }
+            }
+        }
+    }
+
+    function double() public payable gameFinished get_dealer_cards {
+        // modyfikator, ktory sprawdza czy double jest dozwolony
+        if (availableChips[msg.sender] < current_bet[msg.sender]) {
+            //msg.value != current_bet[msg.sender] || rozwazyc opcje z wplatą hajsu
+            revert BetSizeMustBeTheSameOrNotEnoughChips(
+                current_bet[msg.sender]
+            );
+        } else {
+            casinoBalance -= current_bet[msg.sender];
+            availableChips[msg.sender] -= current_bet[msg.sender];
+            current_bet[msg.sender] = current_bet[msg.sender] * 2;
+            cashInPool[msg.sender] += current_bet[msg.sender]; // zastanowic sie czy nie lepiej wyrownac do wartosci 2xcurrent_bet[msg.sender]
+            hit();
+        }
+    }
+
+    function playerHand()
+        public
+        view
+        returns (
+            uint256,
+            uint256,
+            bool
+        )
+    {
+        bytes32 block_nb = blockhash(player_block[msg.sender]);
+        // if (player_block[msg.sender] == 0) {
+        //     revert NotMinedYet();
+        // } else {
+        bool blackjack = false;
+        uint256 first_card = 0;
+        uint256 second_card = 0;
+        first_card = findCard(uint256(block_nb));
+        second_card = findCard(
+            (uint256(block_nb) / uint256(uint160(msg.sender)))
+        );
+        if (first_card + second_card == 1) {
+            blackjack = true;
+        }
+
+        return (first_card, second_card, blackjack); //first_card_player, second_card_player, player_blackjack, first_card_dealer, dealer_blackjack
+        // }
+    }
+
+    function dealersHand()
+        public
+        view
+        returns (
+            uint256,
+            bool,
+            bool
+        )
+    {
+        bytes32 block_nb = blockhash(player_block[msg.sender]);
+        if (player_block[msg.sender] == 0) {
+            revert NotMinedYet();
+        } else {
+            bool dealerBlackJack = false;
+            bool blackjackCheck = false;
+            uint256 first_card = findCard(
+                uint256(block_nb) / uint256(uint160(address(this)))
+            );
+            if (first_card == 11) {
+                blackjackCheck = true;
+                if ((uint256(block_nb) % 10000) < 3077) {
+                    dealerBlackJack = true;
+                }
+            }
+            if (first_card == 10) {
+                blackjackCheck = true;
+                if ((uint256(block_nb) % 10000) < 770) {
+                    dealerBlackJack = true;
+                }
+            }
+            return (first_card, dealerBlackJack, blackjackCheck);
+            //dodac opcje blackjacka, czyli uwzglednic prawdopodobiestwo wylosowania 10 przy asie(4/13) i asa przy 10(1/13)
+        }
+    }
+
+    function currentHitCard() public view returns (uint256) {
+        bytes32 block_nb = blockhash(current_block[msg.sender]);
+        // if (current_block[msg.sender] == 0) {
+        //     revert NotMinedYet();
+        // } else {
+        uint256 current_card = findCard(uint256(block_nb));
+        return (current_card);
+        // }
+    }
+
+    function restOfDealersCards()
+        public
+        view
+        returns (
+            uint256,
+            uint256,
+            uint256,
+            uint256,
+            uint256,
+            uint256,
+            uint256,
+            uint256 ///mozna pomyslec o uwzglednieniu chainlink price feeds
+        )
+    {
+        if (stand_status[msg.sender]) {
+            //uwzglednic sytuacje, w ktorej mimo oblanego checka na blackjacka on sie pojawia
+            // dodac tez funkcje, ktora zwraca wylosowana karte
+            uint256 card1 = findCard(
+                uint256(blockhash(current_block[msg.sender]))
+            );
+            uint256 card2 = findCard(
+                (uint256(blockhash(current_block[msg.sender])) /
+                    uint256(uint160(address(this))))
+            );
+            uint256 card3 = findCard(
+                uint256(blockhash(current_block[msg.sender] + 1))
+            );
+            uint256 card4 = findCard(
+                (uint256(blockhash(current_block[msg.sender] + 1)) /
+                    uint256(uint160(address(this))))
+            );
+            uint256 card5 = findCard(
+                uint256(blockhash(current_block[msg.sender] + 2))
+            );
+            uint256 card6 = findCard(
+                (uint256(blockhash(current_block[msg.sender] + 2)) /
+                    uint256(uint160(address(this))))
+            );
+            uint256 card7 = findCard(
+                uint256(blockhash(current_block[msg.sender] + 3))
+            );
+            uint256 card8 = findCard(
+                (uint256(blockhash(current_block[msg.sender] + 3)) /
+                    uint256(uint160(address(this))))
+            );
+            // uint256 card3 = (uint256(blockhash(current_block[msg.sender] + 1)) %
+            //     9) + 2;
+            // uint256 card4 = ((uint256(
+            //     blockhash(current_block[msg.sender] + 1)
+            // ) / uint256(uint160(address(this)))) % 9) + 2;
+            // uint256 card5 = (uint256(blockhash(current_block[msg.sender] + 2)) %
+            //     9) + 2;
+            // uint256 card6 = ((uint256(
+            //     blockhash(current_block[msg.sender] + 2)
+            // ) / uint256(uint160(address(this)))) % 9) + 2;
+            // uint256 card7 = (uint256(blockhash(current_block[msg.sender] + 3)) %
+            //     9) + 2;
+            // uint256 card8 = ((uint256(
+            //     blockhash(current_block[msg.sender] + 3)
+            // ) / uint256(uint160(address(this)))) % 9) + 2;
+
+            return (card1, card2, card3, card4, card5, card6, card7, card8);
+        }
+    }
+
+    function blockHashCheck() public view returns (uint256) {
+        bytes32 blocks = (blockhash(block.number - 1));
+        return uint256(blocks);
+    }
+
+    function findCard(uint256 number) public pure returns (uint256) {
+        if (number == 0) {
+            return number;
+        }
+        if (number % 52 > 35) {
+            uint256 card = 10;
+            return card;
+        } else {
+            if (((((number % 52) + 1) % 9) + 1) == 1) {
+                uint256 card = 11;
+                return card;
+            } else {
+                uint256 card = ((((number % 52) + 1) % 9) + 1);
+                return card;
+            }
+        }
+    }
+
+    function findDealersSecondCard(uint256 number)
+        public
+        view
+        returns (uint256)
+    {
+        (
+            uint256 firstCard,
+            bool dealerBlackJack,
+            bool blackjackCheck
+        ) = dealersHand();
+        if (blackjackCheck) {
+            if (firstCard == 11 && dealerBlackJack) {
+                uint256 card = 10;
+                return card;
+            } else if (firstCard == 11 && !dealerBlackJack) {
+                uint256 card = (number % 9) + 1;
+                if (card == 1) {
+                    return 11;
+                } else {
+                    return card;
+                }
+            } else if (firstCard == 10 && dealerBlackJack) {
+                uint256 card = 11;
+                return card;
+            } else if (firstCard == 10 && !dealerBlackJack) {
+                uint256 card = (number % 9) + 2;
+                return card;
+            }
+        } else {
+            if (number % 52 > 35) {
+                uint256 card = 10;
+                return card;
+            } else {
+                if (((((number % 52) + 1) % 9) + 1) == 1) {
+                    uint256 card = 11;
+                    return card;
+                } else {
+                    uint256 card = ((((number % 52) + 1) % 9) + 1);
+                    return card;
+                }
+            }
+        }
+    }
+
+    function dealerEndGameHand() public view returns (uint256) {
+        (uint256 card1, , ) = dealersHand();
+        (
+            uint256 card2,
+            uint256 card3,
+            uint256 card4,
+            uint256 card5,
+            uint256 card6,
+            uint256 card7,
+            uint256 card8,
+            uint256 card9
+        ) = restOfDealersCards();
+        uint256[9] memory karty = [
+            card1,
+            card2,
+            card3,
+            card4,
+            card5,
+            card6,
+            card7,
+            card8,
+            card9
+        ];
+        uint256 aces;
+        uint256 sum;
+        for (uint256 i = 0; i <= karty.length; i++) {
+            if (karty[i] == 0) {
+                revert NotMinedYet();
+            }
+            sum = sum + karty[i];
+            if (karty[i] == 11) {
+                aces = aces + 1;
+            }
+            if (sum >= 17 && sum < 22) {
+                return sum; //uwzglednic current_value_dealer[msg.sender]
+            } else if (sum > 21) {
+                if (aces > 0) {
+                    sum = sum - 10;
+                    aces = aces - 1;
+                    if (sum >= 17 && sum < 22) {
+                        return sum;
+                    } else if (sum > 21 && aces == 0) {
+                        return sum;
+                    }
+                } else {
+                    return sum;
+                }
+                //uwzglednic current_value_dealer[msg.sender]
+            }
+        }
+    }
+
+    receive() external payable {}
+}
